@@ -1,0 +1,17 @@
+name: flow
+version: 0.1.0
+cabal-version: >=1.2
+build-type: Simple
+license: AllRightsReserved
+license-file: ""
+synopsis: A lazy, extensible, lightweight, dynamically- and weakly-typed scripting language for Haskell
+description:
+data-dir: ""
+
+library
+        build-depends: base -any, pretty -any, parsec -any, mtl -any, text -any, binary -any,
+                       array -any, containers -any, hslogger -any
+        exposed-modules: Language.Flow
+        exposed: True
+        hs-source-dirs: src
+        ghc-options: -O2
