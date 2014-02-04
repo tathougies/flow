@@ -128,7 +128,9 @@ compileProgram scBase program =
         labelledCompiledSCS = Map.assocs $ Map.mapKeysMonotonic (fromIntegral.(+(fromIntegral scBase))) $ Map.map (compileSC scBase) finalSCS
     in
       GCodeProgram { initCode = [PushLocation $ fromIntegral bodySC + fromIntegral scBase, Eval, ProgramDone],
-                     initialData = labelledCompiledSCS }
+                     initialData = labelledCompiledSCS,
+                     progModules = Map.empty,
+                     progTypes = Map.empty}
 
     where
       compileSC :: GMachineAddress -> SuperCombinator -> GenericGData

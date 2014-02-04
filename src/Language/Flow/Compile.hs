@@ -1,12 +1,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Language.Flow.Compile
-    (runProgramFromString,
+    (FlowCompileOptions(..),
+     runProgramFromString,
      runProgramFromText,
      compileProgramFromString,
      compileProgramFromText,
      compileProgram)
         where
 
+import Control.Applicative
 import Control.Monad
 import Control.Monad.Trans
 import Control.Monad.State
@@ -33,6 +35,7 @@ import Language.Flow.Execution.Types hiding (Ap)
 import Language.Flow.Parse
 import Language.Flow.Module
 import Language.Flow.Execution.GMachine
+import Language.Flow.Types
 
 import System.IO.Unsafe
 import System.Log.Logger
@@ -42,6 +45,7 @@ import Text.Parsec (sourceName, sourceLine, sourceColumn)
 moduleName = "Language.Flow.Compile"
 
 data FlowCompilerState = State {
+      options :: FlowCompileOptions,
       moduleMap :: M.Map ModuleName Module, -- map module names to module objects
       globalModules :: [ModuleName], -- modules in the global namespace
 
@@ -55,7 +59,13 @@ data FlowCompilerState = State {
 
 type FlowCompiler = StateT FlowCompilerState IO
 
+defaultOptions = Options {
+                   builtinModules = M.empty,
+                   builtinTypes = M.empty
+                 }
+
 emptyState = State {
+               options = defaultOptions,
                moduleMap = M.empty,
                globalModules = [],
                referencedSymbols = S.empty,
@@ -99,28 +109,28 @@ getSymbolAddress symbol = do
       modify (\st -> st { symbolMap = M.insert symbol newAddr symMap })
       return newAddr
 
-runProgramFromString :: Typeable a => Int -> a -> String -> IO (GMachineState, GenericGData)
-runProgramFromString cells userState progStr = runProgramFromText cells userState $ fromString progStr
+runProgramFromString :: Typeable a => FlowCompileOptions -> Int -> a -> String -> IO (GMachineState, GenericGData)
+runProgramFromString options cells userState progStr = runProgramFromText options cells userState $ fromString progStr
 
-runProgramFromText :: Typeable a => Int -> a -> T.Text -> IO (GMachineState, GenericGData)
-runProgramFromText cells userState progTxt = do
-  prog <- compileProgramFromText progTxt
+runProgramFromText :: Typeable a => FlowCompileOptions -> Int -> a -> T.Text -> IO (GMachineState, GenericGData)
+runProgramFromText options cells userState progTxt = do
+  prog <- compileProgramFromText options progTxt
   gm <- newGMachineStateWithGCodeProgram cells userState [] prog
   res <- runGMachine continue gm
   case res of
     Left exc -> throwIO exc
     Right x -> return x
 
-compileProgramFromString :: String -> IO GCodeProgram
-compileProgramFromString progStr = compileProgramFromText $ fromString progStr
+compileProgramFromString :: FlowCompileOptions -> String -> IO GCodeProgram
+compileProgramFromString options progStr = compileProgramFromText options $ fromString progStr
 
-compileProgramFromText :: T.Text -> IO GCodeProgram
-compileProgramFromText progTxt = do
+compileProgramFromText :: FlowCompileOptions -> T.Text -> IO GCodeProgram
+compileProgramFromText options progTxt = do
   prog <- parseProgram "<compileProgramFromString>" progTxt
-  compileProgram prog
+  compileProgram options prog
 
-compileProgram :: L.Program -> IO GCodeProgram
-compileProgram program = liftM fst $ runStateT action emptyState
+compileProgram :: FlowCompileOptions -> L.Program -> IO GCodeProgram
+compileProgram options program = liftM fst $ runStateT action (emptyState {options = options})
     where
       action = do
         -- We will now convert the full flow AST into the enriched lambda calculus
@@ -167,9 +177,11 @@ compileProgram program = liftM fst $ runStateT action emptyState
             gcodeProgram = E.compileProgram (curAddress st) program
 
         liftIO $ infoM moduleName $ "\nAnd the compiled gcode"
-        liftIO $ infoM moduleName $ show gcodeProgram
+        liftIO $ infoM moduleName $ show (initialData gcodeProgram, initCode gcodeProgram)
 
-        return $ gcodeProgram { initialData = initData ++ initialData gcodeProgram }
+        return $ gcodeProgram { initialData = initData ++ initialData gcodeProgram,
+                                progModules = builtinModules options,
+                                progTypes = builtinTypes options}
 
 loadAllImports :: L.Program -> FlowCompiler ()
 loadAllImports program = do
@@ -181,7 +193,7 @@ loadAllImports program = do
 
 loadModule :: ModuleName -> ModuleName -> FlowCompiler ()
 loadModule moduleName modulePseudonym = do
-  bm <- liftIO $ getBuiltinModules
+  bm <- builtinModules . options <$> get
   case M.lookup moduleName bm of -- check builtin modules first
     Just mod -> addModule modulePseudonym mod -- simply add the module to the list
     Nothing -> fail $ "need to add support for loading modules from disk: " ++ show moduleName
@@ -417,6 +429,7 @@ lowerASTIntoEnrichedLambdaCalculus (L.Literal _ (L.DoubleLiteral d)) = E.DoubleC
 lowerASTIntoEnrichedLambdaCalculus (L.Case _ (L.VariableRef _ varId) patsAndExprs) =
     let patsAndExprs' = map (\(pat, expr) -> (lowerPat pat, lowerASTIntoEnrichedLambdaCalculus expr)) patsAndExprs
         lowerPat (L.PlaceholderPattern _) = E.PlaceholderPattern
+        -- TODO this is incorrect!
         lowerPat (L.ConstrPattern _ (L.TypeName tName) pats) = E.ConstrPattern tName $ map (\(L.VarIDPattern _ vId) -> vId) pats
     in E.Case varId patsAndExprs'
 

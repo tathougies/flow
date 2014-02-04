@@ -47,7 +47,8 @@ lexer = PT.makeTokenParser flowStyle
 lexeme = PT.lexeme lexer
 parens = PT.parens lexer
 braces = PT.braces lexer
-identifier = (lexeme fullyQualified) <|> (PT.identifier lexer) <?> "identifier"
+brackets = PT.brackets lexer
+identifier = (try $ lexeme fullyQualified) <|> (PT.identifier lexer) <?> "identifier"
     where
       fullyQualified = do
         components <- fullyQualifiedComponents []
@@ -157,6 +158,14 @@ string = liftM L.StringLiteral $
 
       escapeChar x ret = char '\\' >> char x >> return ret
 
+list = brackets $ do
+  startPos <- getPosition
+  literals <- sepBy aexp (lexeme . char $ ',')
+  endPos <- getPosition
+  let r = L.Region startPos endPos
+      mkCons x y = L.Ap r (L.Ap r (L.Identifier r $ fromString "Cons") x) y
+  return (foldr mkCons (L.Identifier r $ fromString "Null") literals)
+
 literal :: FlowParser L.Expression
 literal = do
   startPos <- getPosition
@@ -188,7 +197,7 @@ aexp :: FlowParser L.Expression -- expression parser for only non application no
 aexp = (do
          start <- getPosition
          baseExpr <- (parens expr) <|> (lexeme accessorFunction) <|> lambda <|>
-                      letIn <|> (try $ lexeme literal) <|> identifierExpr <?> "expression"
+                      letIn <|> list <|> (try $ lexeme literal) <|> identifierExpr <?> "expression"
          choice [try $ do
                    reservedOp "::"
                    t <- flowType
@@ -197,15 +206,6 @@ aexp = (do
                  ,
                  return baseExpr]
        ) <?> "expression"
-
-typeAssertionExpr :: FlowParser L.Expression
-typeAssertionExpr = do
-  start <- getPosition
-  l <- aexp
-  reservedOp "::"
-  t <- flowType
-  end <- getPosition
-  return $ L.TypeAssertionE (L.Region start end) l t
 
 letIn :: FlowParser L.Expression
 letIn = do
@@ -219,12 +219,20 @@ letIn = do
 
 pattern :: FlowParser L.Pattern
 pattern = parens pattern <|>
-          literalPat <|>
+          listPattern <|>
+          (try $ lexeme literalPat) <|>
           constrPat <|>
           varName <?> "pattern"
 
 -- constrOrVarPattern = (try constrOrVarPattern') <|> parens constrOrVarPattern <?> "constructor or variable pattern"
 -- constrOrVarPattern' = parens constrPat <|> varName
+
+listPattern = brackets $ do
+                start <- getPosition
+                pats <- sepBy pattern (lexeme . char $ ',')
+                end <- getPosition
+                let mkConsPattern x y = L.ConstrPattern (L.Region start end) (L.TypeName . T.pack $ "Cons") [x, y]
+                return (foldr mkConsPattern (L.ConstrPattern (L.Region start end) (L.TypeName . T.pack $ "Null") []) pats)
 
 literalPat = do
   L.Literal r l <- literal

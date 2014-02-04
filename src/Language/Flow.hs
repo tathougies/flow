@@ -4,8 +4,8 @@ module Language.Flow
      module Language.Flow.AST,
 
      -- Re-exports from Language.Flow.Execution.Types
-     GenericGData(..), GData(..),
-     registerGData, registerBuiltinModule) where
+     GenericGData(..), GData(..), GShow(..), GBinary(..), GMachine(..),
+     gshow') where
 
 import Language.Flow.Compile
 import Language.Flow.Builtin

@@ -1,13 +1,16 @@
-{-# LANGUAGE RankNTypes, ViewPatterns, OverloadedStrings #-}
+{-# LANGUAGE RankNTypes, ViewPatterns, OverloadedStrings, DoAndIfThenElse #-}
 module Language.Flow.Builtin where
 
+import Control.Applicative
 import Control.Monad
 
 import qualified Data.Text as T
+import qualified Data.Map as M
 import Data.List
 import Data.String
 import Data.Array
 
+import Language.Flow.Types
 import Language.Flow.Execution.Types
 import Language.Flow.Execution.GMachine
 import Language.Flow.Module
@@ -93,6 +96,19 @@ constrList (T.unpack -> "Cons") [x, y] = mkGeneric $ GCons x y
 constrList (T.unpack -> "[]") [] = mkGeneric GNull
 constrList cName _ = error $ "Invalid constructor for List: " ++ T.unpack cName
 
+instance GShow GList where
+    gshow x =
+      let collectAll GNull a = return (a [])
+          collectAll (GCons headA tailA) a = do
+                      gEvaluate headA
+                      gEvaluate tailA
+                      head <- readGraph headA
+                      tail <- readGraph tailA
+                      if not . isList $ tail then
+                          throwError "Tail of list was not of type list"
+                      else collectAll (asList tail) (a . (head :))
+      in gshow =<< collectAll x id
+
 instance GData GList where
     typeName _ = fromString "HeadWater.List"
     constr (GCons _ _) = fromString "Cons"
@@ -129,14 +145,25 @@ constrBool (T.unpack -> "True") [] = mkGeneric GTrue
 constrBool (T.unpack -> "False") [] = mkGeneric GFalse
 constrBool _ _ = error "Invalid constructor for Bool"
 
+instance GShow GBool where
+    gshow GTrue = return "True"
+    gshow GFalse = return "False"
+
 instance GData GBool where
     typeName _ = fromString "HeadWater.Bool"
     constr GTrue = fromString "True"
     constr GFalse = fromString "False"
     constrArgs _ = array (0,-1) []
 
-initFlowLanguageBuiltins :: IO ()
-initFlowLanguageBuiltins = do
-  registerBuiltinModule headwater
-  registerGData (undefined :: GBool) constrBool
-  registerGData (undefined :: GList) constrList
+flowBuiltinModules :: M.Map ModuleName Module
+flowBuiltinModules = M.fromList [("HeadWater", headwater)]
+
+flowTypes :: M.Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData)
+flowTypes = M.fromList [(typeName (undefined :: GBool), constrBool),
+                        (typeName (undefined :: GList), constrList)]
+
+flowDefaultCompileOptions :: FlowCompileOptions
+flowDefaultCompileOptions = Options {
+                              builtinModules = flowBuiltinModules,
+                              builtinTypes = flowTypes
+                            }

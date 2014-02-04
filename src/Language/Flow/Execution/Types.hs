@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, BangPatterns, ExistentialQuantification, RankNTypes, DeriveDataTypeable, RecordWildCards #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, BangPatterns, ExistentialQuantification, RankNTypes, DeriveDataTypeable, RecordWildCards, MultiParamTypeClasses #-}
 module Language.Flow.Execution.Types where
 
 import qualified Data.IntSet as IntSet
@@ -8,13 +8,18 @@ import Data.Array as A
 import Data.Word
 import Data.Either
 import Data.Int
-import Data.Text
+import qualified Data.List as L
+import Data.Text hiding (length)
 import Data.String
 import Data.Binary
+import Data.Binary.Put
 import Data.Dynamic
 import Data.IORef
 
+import Control.Applicative
 import Control.Monad
+import qualified Control.Monad.State as S
+import Control.Monad.Reader
 import Control.Monad.Trans
 import Control.Exception
 
@@ -55,9 +60,15 @@ data GMachine a =
 data GCodeProgram =
     GCodeProgram {
       initCode :: GCodeSequence,
-      initialData :: [(GMachineAddress, GenericGData)]
+      initialData :: [(GMachineAddress, GenericGData)],
+      progModules :: M.Map ModuleName Module,
+      progTypes :: Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData)
     }
-    deriving (Show)
+
+data GMachineContext = GMachineContext {
+      gmcModules :: Map ModuleName Module,
+      gmcTypes :: Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData)
+    }
 
 data GMachineState = GMachineState {
       gmachineStack :: GMachineStack,
@@ -68,7 +79,8 @@ data GMachineState = GMachineState {
       gmachineFreeCells :: IntSet.IntSet,
       gmachineIndent :: Int,
       gmachineDebug :: Bool,
-      gmachineUserState :: Dynamic
+      gmachineUserState :: Dynamic,
+      gmachineContext :: GMachineContext
     }
 
 data GMachineFrozenState = GMachineFrozenState {
@@ -80,42 +92,83 @@ data GMachineFrozenState = GMachineFrozenState {
       gmachineFrozenFreeCells :: IntSet.IntSet,
       gmachineFrozenDebug :: Bool
     }
- deriving (Show)
+
+instance Monad GMachine where
+    return x = GMachine (\st -> return $ Right (st, x))
+    a >>= b = GMachine (\st -> do
+                          aRet <- runGMachine a st
+                          case aRet of
+                            Left e -> return $ Left e
+                            Right (newState, retVal) ->
+                                runGMachine (b retVal) newState)
+
+instance S.MonadState GMachineState GMachine where
+    get = GMachine (\st -> return $ Right (st, st))
+    put x = GMachine (\_ -> return $ Right (x, ()))
+
+instance Applicative GMachine where
+    pure = return
+    f <*> x = do
+      f' <- f
+      x' <- x
+      return (f' x')
+
+instance Functor GMachine where
+    fmap f x = do
+      x' <- x
+      return (f x')
+
+instance MonadIO GMachine where
+    liftIO f = GMachine (\st -> do
+                           ret <- f
+                           return $ Right (st, ret))
 
 instance Read GMachineFrozenState where -- necessary so that MapOperation is Read'able
     readsPrec = error "Can't read GMachineFrozenState"
 
-instance Binary GMachineFrozenState where
-    put GMachineFrozenState {..} = do
-      put gmachineFrozenStack
-      put gmachineFrozenGraph
-      put gmachineFrozenCode
-      put gmachineFrozenDump
-      put gmachineFrozenInitData
-      put gmachineFrozenFreeCells
-      put gmachineFrozenDebug
+instance GBinary GMachineAddress where
+    gput = lift . put
+    gget = lift get
 
-    get = return GMachineFrozenState `ap` get `ap` get `ap` get `ap`
-          get `ap` get `ap` get `ap` get
+instance (GBinary a, GBinary b) => GBinary (a, b) where
+    gput (a, b) = gput a >> gput b
+    gget = (,) <$> gget <*> gget
+
+instance GBinary a => GBinary [a] where
+    gput a = (lift . put . length $ a) >> mapM_ gput a
+    gget = do
+      l <- lift (get :: Get Int)
+      replicateM l gget
+
+instance (Ix i, GBinary i, GBinary b) => GBinary (Array i b) where
+    gput a = do
+      gput (bounds a)
+      gput (A.assocs a)
+
+    gget = do
+      bounds <- gget
+      assocs <- gget
+      return (array bounds assocs)
+
+instance GBinary GMachineFrozenState where
+    gput GMachineFrozenState {..} = do
+      lift (put gmachineFrozenStack)
+      gput gmachineFrozenGraph
+      lift (put gmachineFrozenCode)
+      lift (put gmachineFrozenDump)
+      lift (put gmachineFrozenInitData)
+      lift (put gmachineFrozenFreeCells)
+      lift (put gmachineFrozenDebug)
+
+    gget = GMachineFrozenState <$>
+           lift get <*> gget <*>
+           lift get <*> lift get <*> lift get <*>
+           lift get <*> lift get
 
 data Module = Module {
             flowModuleName :: ModuleName,
             flowModuleMembers :: M.Map VariableName GenericGData
     }
- deriving Show
-
-{-# NOINLINE builtinModules #-}
-builtinModules :: IORef (M.Map ModuleName Module)
-builtinModules = unsafePerformIO $ do
-                   newIORef $ M.fromList $ Prelude.map (\m -> (flowModuleName m, m)) []
-
-getBuiltinModules :: IO (M.Map ModuleName Module)
-getBuiltinModules = readIORef builtinModules
-
-registerBuiltinModule :: Module -> IO ()
-registerBuiltinModule mod =
-    modifyIORef builtinModules $
-                M.insert (flowModuleName mod) mod
 
 -- | G-Machine instructions as found in Simon Peyton-Jones's book w/ some modifications
 data GCode =
@@ -242,10 +295,35 @@ withGenericData f (G x) = f x
 
 usingGenericData = flip withGenericData
 
+type GPut = ReaderT GMachineContext PutM ()
+type GGet = ReaderT GMachineContext Get
+
+-- | A generic class for all things that can be serialized or unserialized given a GMachineContext
+class GBinary a where
+    gput :: a -> GPut
+    gget :: GGet a
+
+-- | A generic class for things that can be shown given a GMachineState
+class GShow a where
+    gshow :: a -> GMachine String
+
+instance GShow a => GShow [a] where
+    gshow [] = return "[]"
+    gshow xs = do
+      body <- L.intercalate ", " <$> mapM gshow xs
+      return (L.concat ["[", body, "]"])
+
+gshow' :: GShow a => GMachineState -> a -> IO (GMachineState, String)
+gshow' st x = do
+  a <- runGMachine (gshow x) st
+  case a of
+    Left error -> throwIO error
+    Right (st, s) -> return (st, s)
+
 -- | A generic class for all data types that can be put into the G-Machine graph
 -- it contains functions that are necessary for the type checker, the constructor
 -- matching system, and the garbage collector
-class (Show a) => GData a where
+class (GShow a) => GData a where
     -- | Returns the type name of the this data. This function may be strict in its first argument
     typeName :: a -> GTypeName
 
@@ -272,38 +350,32 @@ class (Show a) => GData a where
     runGeneric :: a -> String -> [GenericGData] -> GMachine (Maybe GenericGData)
     runGeneric a gen = error $ "Generic " ++ gen ++ " not supported by " ++ (unpack $ typeName a)
 
-{-# NOINLINE gDataConstrFuncsVar #-}
-gDataConstrFuncsVar :: IORef (Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData))
-gDataConstrFuncsVar = unsafePerformIO $ newIORef M.empty
-
-gDataConstrFuncs :: Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData)
-gDataConstrFuncs = unsafePerformIO $ readIORef gDataConstrFuncsVar
-
-registerGData :: GData a => a -> (GConstr -> [GMachineAddress] -> GenericGData) -> IO ()
-registerGData gData gConstrFunc =
-  modifyIORef gDataConstrFuncsVar $ M.insert (typeName gData) gConstrFunc
-
 instance Show GenericGData where
     show Hole = "Hole"
-    show x = withGenericData show x
+    show x = "GenericGData"
+
+instance GShow GenericGData where
+    gshow Hole = pure "Hole"
+    gshow x = withGenericData gshow x
 
 instance Binary Text where
     put = put . unpack
     get = liftM pack get
 
-instance Binary GenericGData where
-    put Hole = put (-1 :: Int8)
-    put x
-     | isInteger x = do
+-- TODO get rid of this
+instance GBinary GenericGData where
+    gput Hole = lift (put (-1 :: Int8))
+    gput x
+     | isInteger x = lift $ do
            put (1 :: Int8)
            put (asInteger x)
-     | isString x = do
+     | isString x = lift $ do
            put (2 :: Int8)
            put (asString x)
-     | isDouble x = do
+     | isDouble x = lift $ do
            put (3 :: Int8)
            put (asDouble x)
-     | withGenericData isBuiltin x =
+     | withGenericData isBuiltin x = lift $
            case withGenericData asBuiltin x of
              Ap a b -> do
                put (4 :: Int8)
@@ -317,31 +389,31 @@ instance Binary GenericGData where
                put (6 :: Int8)
                put modName
                put symName
-     | otherwise = do
+     | otherwise = lift $ do
            put (0 :: Int8)
            put (withGenericData typeName x)
            put (withGenericData constr x)
            put (A.elems $ withGenericData constrArgs x)
 
-    get = do
-      tag <- (get :: Get Int8)
+    gget = do
+      tag <- lift (get :: Get Int8)
       case tag of
         -1 -> return Hole
-        1 {- IntConstant -} -> liftM (mkGeneric . IntConstant) get
-        2 {- StringConstant -} -> liftM (mkGeneric . StringConstant) get
-        3 {- DoubleConstant -} -> liftM (mkGeneric . DoubleConstant) get
-        4 {- BuiltinData Ap -} -> do
+        1 {- IntConstant -} -> liftM (mkGeneric . IntConstant) (lift get)
+        2 {- StringConstant -} -> liftM (mkGeneric . StringConstant) (lift get)
+        3 {- DoubleConstant -} -> liftM (mkGeneric . DoubleConstant) (lift get)
+        4 {- BuiltinData Ap -} -> lift $ do
                                a <- get
                                b <- get
                                return $ mkGeneric $ Ap a b
-        5 {- BuiltinData Fun -} -> do
+        5 {- BuiltinData Fun -} -> lift $ do
                                arity <- get
                                code <- get
                                return $ mkGeneric $ Fun arity code
         6 {- BuiltinData BuiltinFun -} -> do
-                               modName <- get
-                               symName <- get
-                               let allBuiltinModules = unsafePerformIO $ readIORef builtinModules
+                               modName <- lift get
+                               symName <- lift get
+                               allBuiltinModules <- gmcModules <$> ask
                                case M.lookup modName allBuiltinModules of
                                  Nothing -> error $ "Could not find builtin module " ++ show modName
                                  Just Module { flowModuleMembers = mod } ->
@@ -349,30 +421,34 @@ instance Binary GenericGData where
                                        Nothing -> error $ "Could not find " ++ show symName ++ " in " ++ show modName
                                        Just sym -> return sym
         0 -> do
-            typeName <- (get :: Get GTypeName)
-            case M.lookup typeName gDataConstrFuncs of
+            typeName <- lift (get :: Get GTypeName)
+            constrFuncs <- gmcTypes <$> ask
+            case M.lookup typeName constrFuncs of
               Nothing -> fail $ "Could not find constructor function for type " ++ show typeName
               Just constrFunc -> do
-                               constrName <- (get :: Get GConstr)
-                               constrArgs <- (get :: Get [GMachineAddress])
+                               constrName <- lift (get :: Get GConstr)
+                               constrArgs <- lift (get :: Get [GMachineAddress])
                                return $ constrFunc constrName constrArgs
 
 -- Data types
 
 checkCoerce :: GTypeName -> GenericGData -> b
-checkCoerce name x = if checkType name x then withGenericData unsafeCoerce x else error $ "checkCoerce " ++ show x
+checkCoerce name x = if checkType name x then withGenericData unsafeCoerce x else error "checkCoerce failed"
 
 checkType :: GTypeName -> GenericGData -> Bool
 checkType name = withGenericData (\gData -> typeName gData == name)
 
 newtype IntConstant = IntConstant Int64
-    deriving (Ord, Eq, Enum, Num, Real, Integral, Show, Read)
+    deriving (Ord, Eq, Enum, Num, Real, Integral, Read)
 
 isInteger :: GenericGData -> Bool
 isInteger = checkType (typeName (undefined :: IntConstant))
 
 asInteger :: GenericGData -> Int64
 asInteger = checkCoerce (typeName (undefined :: IntConstant))
+
+instance GShow IntConstant where
+    gshow (IntConstant i) = pure (show i)
 
 instance GData IntConstant where
     typeName _ = fromString "Integer"
@@ -388,6 +464,9 @@ isString = checkType (typeName (undefined :: StringConstant))
 asString :: GenericGData -> Text
 asString = checkCoerce (typeName (undefined :: StringConstant))
 
+instance GShow StringConstant where
+    gshow (StringConstant s) = pure (show s)
+
 instance GData StringConstant where
     typeName _ = fromString "String"
     constr (StringConstant x) = fromString $ show x
@@ -402,6 +481,9 @@ isDouble = checkType (typeName (undefined :: DoubleConstant))
 asDouble :: GenericGData -> Double
 asDouble = checkCoerce (typeName (undefined :: DoubleConstant))
 
+instance GShow DoubleConstant where
+    gshow (DoubleConstant d) = pure (show d)
+
 instance GData DoubleConstant where
     typeName _ = fromString "Double"
     constr x = fromString $ show x
@@ -413,7 +495,10 @@ data BuiltinData = Ap {-# UNPACK #-} !GMachineAddress {-# UNPACK #-} !GMachineAd
 
 asBuiltin :: GData a => a -> BuiltinData
 asBuiltin dat = if isBuiltin dat then unsafeCoerce dat else
-                    error $ "Cannot coerce builtin data for " ++ show dat
+                    error $ "Cannot coerce builtin data"
+
+instance GShow BuiltinData where
+    gshow a = pure (show a)
 
 instance GData BuiltinData where
     typeName _ = fromString "BuiltinData"

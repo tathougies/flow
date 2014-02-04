@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, MultiParamTypeClasses, RecordWildCards #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, RecordWildCards #-}
 module Language.Flow.Execution.GMachine
     (
      runGMachine,
@@ -47,24 +47,6 @@ import Data.Array as AS
 
 import Language.Flow.Execution.Types
 
-instance Monad GMachine where
-    return x = GMachine (\st -> return $ Right (st, x))
-    a >>= b = GMachine (\st -> do
-                          aRet <- runGMachine a st
-                          case aRet of
-                            Left e -> return $ Left e
-                            Right (newState, retVal) ->
-                                runGMachine (b retVal) newState)
-
-instance MonadState GMachineState GMachine where
-    get = GMachine (\st -> return $ Right (st, st))
-    put x = GMachine (\_ -> return $ Right (x, ()))
-
-instance MonadIO GMachine where
-    liftIO f = GMachine (\st -> do
-                           ret <- f
-                           return $ Right (st, ret))
-
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
 isLeft _ = False
@@ -75,10 +57,14 @@ fromLeft _ = error "Right"
 
 newGMachineStateWithGCodeProgram :: Typeable a => Int -> a -> [(GMachineAddress, GenericGData)] -> GCodeProgram -> IO GMachineState
 newGMachineStateWithGCodeProgram cells userState initData prog =
-      newGMachine cells userState (initCode prog) (initData ++ initialData prog)
+    let context = GMachineContext {
+                    gmcModules = progModules prog,
+                    gmcTypes = progTypes prog}
+    in newGMachine cells userState context (initCode prog) (initData ++ initialData prog)
 
-newGMachine :: Typeable a => Int -> a -> GCodeSequence -> [(GMachineAddress, GenericGData)] -> IO GMachineState
-newGMachine graphSize userState initCode initData =
+newGMachine :: Typeable a => Int -> a -> GMachineContext ->
+               GCodeSequence -> [(GMachineAddress, GenericGData)] -> IO GMachineState
+newGMachine graphSize userState gmc initCode initData =
     do
       graph <- newArray (GMachineAddress 0, GMachineAddress $ graphSize - 1) Hole
       let gmachine = GMachineState { gmachineStack = [], -- create initial gmachine, so we can run allocGraphCells
@@ -89,7 +75,8 @@ newGMachine graphSize userState initCode initData =
                                      gmachineFreeCells = IntSet.fromList [0..graphSize - 1],
                                      gmachineIndent = 0,
                                      gmachineDebug = False,
-                                     gmachineUserState = toDyn userState}
+                                     gmachineUserState = toDyn userState,
+                                     gmachineContext = gmc}
 
       res <- runGMachine (forM_ initData $
                             (\(addr, dat) -> do
@@ -379,7 +366,9 @@ doUnwind = do
                                        Ap _ _ -> return () -- these are the valid types
                                        Fun _ _ -> return ()
                                        BuiltinFun _ _ _ _-> return ()
-                                 else throwError $ "Cannot apply non-function value " ++ show vData' ++ " to arguments"-- invalid type
+                                 else do
+                                   d <- gshow vData'
+                                   throwError $ "Cannot apply non-function value " ++ d ++ " to arguments"-- invalid type
                             )
 
                         pushStack v'
@@ -453,6 +442,7 @@ doJFalse _ = throwError "not implemented"
 doExamine :: T.Text -> Int -> Label -> GMachine ()
 doExamine expectedName arity offs = do
   vAddr <- topOfStack
+  gEvaluate vAddr
   vGeneric <- readGraph vAddr
   let actualName = withGenericData constr vGeneric
       actualArgs = AS.elems $ withGenericData constrArgs vGeneric
@@ -558,4 +548,7 @@ thawState userSt GMachineFrozenState {..} = do
                gmachineFreeCells = gmachineFrozenFreeCells,
                gmachineIndent = 0,
                gmachineDebug = gmachineFrozenDebug,
-               gmachineUserState = toDyn userSt}
+               gmachineUserState = toDyn userSt,
+               gmachineContext = GMachineContext {
+                                   gmcModules = Map.empty,
+                                   gmcTypes = Map.empty}}
