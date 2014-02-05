@@ -28,18 +28,18 @@ import System.IO.Unsafe
 import Unsafe.Coerce
 
 newtype GMachineAddress = GMachineAddress Int
-    deriving (Ord, Eq, Enum, Show, Read, Num, Ix, Integral, Real, Binary)
+    deriving (Ord, Eq, Enum, Read, Num, Ix, Integral, Real, Binary)
 newtype StackOffset = StackOffset Int
-    deriving (Ord, Eq, Enum, Show, Read, Num, Ix, Integral, Real, Binary)
+    deriving (Ord, Eq, Enum, Read, Num, Ix, Integral, Real, Binary)
 newtype VarID = VarID Int
     deriving (Ord, Eq, Show, Read, Num, Integral, Real, Enum)
 newtype SCName = SCName Int
     deriving (Ord, Eq, Show, Read, Num, Integral, Real, Enum)
-newtype VariableName = VariableName Text
+newtype VariableName = VariableName { unVariableName :: Text }
     deriving (Ord, Eq, Show, Read, IsString, Binary)
 newtype TypeName = TypeName Text
     deriving (Ord, Eq, Show, Read, IsString, Binary)
-newtype ModuleName = ModuleName Text
+newtype ModuleName = ModuleName { unModuleName :: Text }
     deriving (Ord, Eq, Show, Read, IsString, Binary)
 
 type Label = Int
@@ -62,7 +62,9 @@ data GCodeProgram =
       initCode :: GCodeSequence,
       initialData :: [(GMachineAddress, GenericGData)],
       progModules :: M.Map ModuleName Module,
-      progTypes :: Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData)
+      progTypes :: Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData),
+      progDebug :: Bool,
+      progTrace :: Bool
     }
 
 data GMachineContext = GMachineContext {
@@ -79,6 +81,7 @@ data GMachineState = GMachineState {
       gmachineFreeCells :: IntSet.IntSet,
       gmachineIndent :: Int,
       gmachineDebug :: Bool,
+      gmachineTracing :: Bool,
       gmachineUserState :: Dynamic,
       gmachineContext :: GMachineContext
     }
@@ -90,7 +93,8 @@ data GMachineFrozenState = GMachineFrozenState {
       gmachineFrozenDump :: [(GMachineStack, GCodeSequence)],
       gmachineFrozenInitData :: [GMachineAddress],
       gmachineFrozenFreeCells :: IntSet.IntSet,
-      gmachineFrozenDebug :: Bool
+      gmachineFrozenDebug :: Bool,
+      gmachineFrozenTracing :: Bool
     }
 
 instance Monad GMachine where
@@ -159,11 +163,12 @@ instance GBinary GMachineFrozenState where
       lift (put gmachineFrozenInitData)
       lift (put gmachineFrozenFreeCells)
       lift (put gmachineFrozenDebug)
+      lift (put gmachineFrozenTracing)
 
     gget = GMachineFrozenState <$>
            lift get <*> gget <*>
            lift get <*> lift get <*> lift get <*>
-           lift get <*> lift get
+           lift get <*> lift get <*> lift get
 
 data Module = Module {
             flowModuleName :: ModuleName,
@@ -198,6 +203,9 @@ data GCode =
     CallBuiltin |
     ProgramDone
     deriving (Show, Eq)
+
+instance GShow GCode where
+    gshow = return . show
 
 instance Binary GCode where
     put Eval = put (0 :: Int8)
@@ -313,12 +321,37 @@ instance GShow a => GShow [a] where
       body <- L.intercalate ", " <$> mapM gshow xs
       return (L.concat ["[", body, "]"])
 
+instance (GShow a, GShow b) => GShow (a, b) where
+    gshow (x, y) = do
+      xs <- gshow x
+      ys <- gshow y
+      return (L.concat ["(",xs,", ",ys,")"])
+
+instance Show GMachineAddress where
+    show (GMachineAddress i) = "#@" ++ show i
+
+instance Show StackOffset where
+    show (StackOffset i) = L.concat ["(", show (-i), ")"]
+
+instance GShow GMachineAddress where
+    gshow = return . show
+
 gshow' :: GShow a => GMachineState -> a -> IO (GMachineState, String)
 gshow' st x = do
   a <- runGMachine (gshow x) st
   case a of
     Left error -> throwIO error
     Right (st, s) -> return (st, s)
+
+readGraph :: GMachineAddress -> GMachine GenericGData
+readGraph addr = do
+  graphData <- liftM gmachineGraph S.get
+  liftIO $ readArray graphData addr
+
+writeGraph :: GMachineAddress -> GenericGData -> GMachine ()
+writeGraph addr x = do
+  graphData <- liftM gmachineGraph S.get
+  liftIO $ writeArray graphData addr x
 
 -- | A generic class for all data types that can be put into the G-Machine graph
 -- it contains functions that are necessary for the type checker, the constructor
@@ -498,7 +531,12 @@ asBuiltin dat = if isBuiltin dat then unsafeCoerce dat else
                     error $ "Cannot coerce builtin data"
 
 instance GShow BuiltinData where
-    gshow a = pure (show a)
+    gshow (Ap a b) = do
+      as <- gshow a
+      bs <- gshow b
+      return (L.concat [as, " ", bs])
+    gshow (Fun i s) = pure ("Fun " ++ show i ++ " " ++ show s)
+    gshow (BuiltinFun i modName symbolName _) = pure ("BuiltinFun " ++ show i ++ " (" ++ (unpack . unVariableName $ symbolName) ++ " from " ++ (unpack . unModuleName $ modName) ++ ")")
 
 instance GData BuiltinData where
     typeName _ = fromString "BuiltinData"
@@ -510,7 +548,7 @@ instance GData BuiltinData where
 instance Show BuiltinData where
     show (Ap a b) = "Ap (" ++ show a ++ ") (" ++ show b ++ ")"
     show (Fun i s) = "Fun " ++ show i ++ " " ++ show s
-    show (BuiltinFun i modName symbolName _) = "BuiltinFun " ++ show i ++ " (" ++ show symbolName ++ " from " ++ show modName ++ ")"
+    show (BuiltinFun i modName symbolName _) = "BuiltinFun " ++ show i ++ " (" ++ (unpack . unVariableName $ symbolName) ++ " from " ++ (unpack . unModuleName $ modName) ++ ")"
 
 instance Show GMachineError where
     show (GMachineError _ e) = e

@@ -109,7 +109,7 @@ infixOp op assoc = let parser = do
 
 expr = PE.buildExpressionParser opTable apOrAtom <?> "expression"
 
-integer, double, string, dateTime, duration :: FlowParser L.Literal
+integer, double, string :: FlowParser L.Literal
 integer = do -- parse integers of the form I<nnnn>
   char 'I'
   invert <- optionMaybe $ char '-'
@@ -124,9 +124,6 @@ integer = do -- parse integers of the form I<nnnn>
   return $ L.IntLiteral $ fromIntegral integerForm
 
 double = liftM L.DoubleLiteral $ PT.float lexer
-
-dateTime = fail "dateTime"
-duration = fail "duration"
 
 string = liftM L.StringLiteral $
          ( (try singleQuotedMLString) <|> (try doubleQuotedMLString) <|>
@@ -169,7 +166,7 @@ list = brackets $ do
 literal :: FlowParser L.Expression
 literal = do
   startPos <- getPosition
-  literal <- integer <|> string <|> double <|> dateTime <|> duration <?> "Expecting literal"
+  literal <- integer <|> string <|> double <?> "Expecting literal"
   endPos <- getPosition
   return $ L.Literal (L.Region startPos endPos) literal
 
@@ -258,13 +255,10 @@ flowType :: FlowParser L.Type
 flowType = (try fnType) <|>
            nonFnType <?> "type"
     where
-      primType = integerType <|> stringType <|> doubleType <|> durationType <|>
-                 dateTimeType <|> typeVar <?> "primitive type"
+      primType = integerType <|> stringType <|> doubleType <|> typeVar <?> "primitive type"
 
       nonFnType = parens flowType <|>
-                  primType <|>
-                  timeSeriesCollectionType <|>
-                  timeSeriesType <?> "non-function type"
+                  primType <?> "non-function type"
 
       typeVar = liftM L.TypeVariable variableName
 
@@ -272,28 +266,11 @@ flowType = (try fnType) <|>
         a <- nonFnType
         reservedOp "->"
         b <- flowType
-        return $ L.FnType a b
+        return $ L.fnType a b
 
-      timeSeriesCollectionType = do
-        reserved "TimeSeriesCollection"
-        subType <- primType
-        return $ L.TimeSeriesCollectionType subType
-
-      timeSeriesType = do
-        reserved "TimeSeries"
-        subType <- primType
-        try (do
-              frequency <- natural
-              return $ L.TimeSeriesTypeAbs subType frequency) <|>
-         do
-           varName <- variableName
-           return $ L.TimeSeriesTypeVar subType varName
-
-      integerType = typeName "Integer" L.IntegerType
-      stringType = typeName "String" L.StringType
-      doubleType = typeName "Double" L.DoubleType
-      durationType = typeName "Duration" L.DurationType
-      dateTimeType = typeName "DateTime" L.DateTimeType
+      integerType = typeName "Integer" L.intType
+      stringType = typeName "String" L.stringType
+      doubleType = typeName "Double" L.doubleType
 
       typeName name r = do
         reserved name

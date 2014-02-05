@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, OverloadedStrings #-}
 module Language.Flow.AST
     ( Program(..),
       Expression(..),
@@ -7,15 +7,19 @@ module Language.Flow.AST
       TypeAssertion(..),
       Pattern(..),
       Type(..),
+      TyConName(..),
       VariableName(..),
       TypeName(..),
       Region(..),
+      VarID(..),
 
       getUniversalImports,
       addUniversalImport,
 
       exprRegion,
-      prettyPrintAST
+      prettyPrintAST,
+
+      intType, stringType, doubleType, fnType
     ) where
 
 import qualified Data.Text as T
@@ -30,6 +34,9 @@ import System.IO.Unsafe
 import Text.Parsec (SourcePos)
 import Text.PrettyPrint.HughesPJ
 
+newtype TyConName = TyConName { unTyConName :: T.Text }
+    deriving (Show, Eq, Ord, IsString)
+
 data Pattern =
     VariablePattern Region VariableName | -- Constructor arguments
     ConstrPattern Region TypeName [Pattern] | -- Unpacking a constructor
@@ -39,17 +46,10 @@ data Pattern =
     VarIDPattern Region VarID
     deriving (Show)
 
-data Type = IntegerType |
-            StringType |
-            DoubleType |
-            DurationType |
-            DateTimeType |
-            TimeSeriesCollectionType !Type |
-            TimeSeriesTypeAbs !Type !Integer |
-            TimeSeriesTypeVar !Type VariableName |
-            FnType !Type !Type |
-            TypeVariable VariableName
-            deriving (Show)
+data Type = TypeVariable VariableName |
+            TypeConstructor TyConName [Type]
+            deriving (Eq, Ord)
+
 data Literal = IntLiteral Int64 |
                StringLiteral String |
                DoubleLiteral Double
@@ -80,7 +80,8 @@ data Expression =
 
     -- Internal use only
     LocationRef Region GMachineAddress |
-    VariableRef Region VarID
+    VariableRef Region VarID |
+    SimpleLet Region (VarID, Expression) Expression -- Non recursive let, only used internally
     deriving Show
 
 -- | A data type used to represent a complete Flow progra
@@ -89,6 +90,32 @@ data Program = Program {
       flowGlobalImports :: [ModuleName],
       flowProgramBody :: Expression
     }
+
+instance Show Type where
+    show (TypeVariable var) = T.unpack . unVariableName $ var
+    show (TypeConstructor "(->)" [x, y]) = concat [case x of
+                                                     TypeConstructor "(->)" -> concat ["(", show x, ")"]
+                                                     _ -> show x,
+                                                   " -> ",
+                                                   case y of
+                                                     TypeConstructor "(->)" _ -> show y
+                                                     _ -> show y]
+    show (TypeConstructor con args)
+
+intTyName, stringTyName, doubleTyName, arrowTyName :: TyConName
+intTyName = "Integer"
+stringTyName = "String"
+doubleTyName = "Double"
+arrowTyName = "(->)"
+
+intType, stringType, doubleType :: Type
+intType = TypeConstructor intTyName []
+stringType = TypeConstructor stringTyName []
+doubleType = TypeConstructor doubleTyName []
+
+-- | `fnType a b` Constructs the type `a -> b`
+fnType :: Type -> Type -> Type
+fnType a b = TypeConstructor arrowTyName [a, b]
 
 {-# NOINLINE universalImportsVar #-}
 universalImportsVar :: IORef [(ModuleName, ModuleName)]
@@ -106,6 +133,7 @@ exprRegion (Identifier x _) = x
 exprRegion (Literal x _) = x
 exprRegion (Ap x _ _) = x
 exprRegion (LetIn x _ _ _) = x
+exprRegion (SimpleLet x _ _) = x
 exprRegion (TypeAssertionE x _ _) = x
 exprRegion (Block x _) = x
 exprRegion (Lambda x _ _) = x
@@ -128,6 +156,7 @@ prettyPrintAST e = render $ prettyPrintAST' e
               bindingsDoc = vcat $ punctuate semi $ map prettyPrintBinding bindings
           in text "let" <+> braces (nest 4 $ assertionsDoc $+$ bindingsDoc) <+> text "in" <+>
              nest 4 (prettyPrintAST' expression)
+      prettyPrintAST' (SimpleLet r (var, binding) expr) = prettyPrintAST' (LetIn r [] [Binding r (VarIDPattern r var) binding] expr)
       prettyPrintAST' (TypeAssertionE _ e t) = parens $ prettyPrintAST' e <+> text "::" <+> prettyPrintType t
       prettyPrintAST' (Block _ es) = braces $ nest 4 $ vcat $ punctuate semi $ map prettyPrintAST' es
       prettyPrintAST' (Lambda _ pats e) = parens $ text "\\" <> (hcat $ map prettyPrintPattern pats) <+> text "->" <+> prettyPrintAST' e
@@ -140,16 +169,9 @@ prettyPrintAST e = render $ prettyPrintAST' e
       prettyPrintPattern (ConstrPattern _ (TypeName t) pats) = parens $ (text $ T.unpack t) <+> (hsep $ map prettyPrintPattern pats)
       prettyPrintPattern (PlaceholderPattern _) = text "_"
 
-      prettyPrintType IntegerType = text "Integer"
-      prettyPrintType StringType = text "String"
-      prettyPrintType DoubleType = text "Double"
-      prettyPrintType DurationType = text "Duration"
-      prettyPrintType DateTimeType = text "DateTime"
-      prettyPrintType (TimeSeriesCollectionType t) = text "TimeSeriesCollection" <+> prettyPrintType t
-      prettyPrintType (TimeSeriesTypeAbs t i) = text "TimeSeries" <+> prettyPrintType t <+> (text $ show i)
-      prettyPrintType (TimeSeriesTypeVar t (VariableName v)) = text "TimeSeries" <+> prettyPrintType t <+> (text $ T.unpack v)
-      prettyPrintType (FnType t1@(FnType _ _) t2) = (parens $ prettyPrintType t1) <+> text "->" <+> prettyPrintType t2
-      prettyPrintType (FnType t1 t2) = prettyPrintType t1 <+> text "->" <+> prettyPrintType t2
+      prettyPrintType (TypeConstructor name [a, b])
+          | name == arrowTyName = prettyPrintType a <+> text "->" <+> prettyPrintType b
+      prettyPrintType (TypeConstructor (TyConName name) args) = (text . T.unpack $name) <+> (hsep $ map prettyPrintType args)
       prettyPrintType (TypeVariable (VariableName v)) = text $ T.unpack v
 
       prettyPrintBinding (Binding _ pat expr) = prettyPrintPattern pat <+> equals <+> prettyPrintAST' expr

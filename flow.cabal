@@ -11,7 +11,7 @@ data-dir: ""
 library
         build-depends: base -any, pretty -any, parsec -any, mtl -any, text -any, binary -any,
                        array -any, containers -any, hslogger -any
-        exposed-modules: Language.Flow Language.Flow.Builtin Language.Flow.Compile Language.Flow.Execution.Types Language.Flow.AST Language.Flow.Execution.GMachine Language.Flow.Lambda.Enriched Language.Flow.Module Language.Flow.Parse Language.Flow.Types
+        exposed-modules: Language.Flow Language.Flow.Builtin Language.Flow.Compile Language.Flow.Execution.Types Language.Flow.AST Language.Flow.Execution.GMachine Language.Flow.Lambda.Enriched Language.Flow.Module Language.Flow.Parse Language.Flow.Types Language.Flow.Lambda.Typed
         exposed: True
         hs-source-dirs: src
         ghc-options: -O2

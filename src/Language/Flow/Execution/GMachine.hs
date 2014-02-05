@@ -1,4 +1,4 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving, RecordWildCards #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, RecordWildCards, DoAndIfThenElse #-}
 module Language.Flow.Execution.GMachine
     (
      runGMachine,
@@ -34,6 +34,7 @@ module Language.Flow.Execution.GMachine
 import Control.Monad
 import Control.Monad.State
 import Control.Monad.Trans
+import Control.Applicative
 
 import qualified Data.Map as Map
 import qualified Data.IntSet as IntSet
@@ -45,7 +46,14 @@ import Data.Typeable
 import Data.Array.IO
 import Data.Array as AS
 
+import Text.Printf
+
 import Language.Flow.Execution.Types
+
+import System.Log.Logger
+import System.IO
+
+moduleName = "Language.Flow.Execution.GMachine"
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
@@ -60,11 +68,12 @@ newGMachineStateWithGCodeProgram cells userState initData prog =
     let context = GMachineContext {
                     gmcModules = progModules prog,
                     gmcTypes = progTypes prog}
-    in newGMachine cells userState context (initCode prog) (initData ++ initialData prog)
+    in newGMachine cells userState context (initCode prog) (initData ++ initialData prog) (progDebug prog) (progTrace prog)
 
 newGMachine :: Typeable a => Int -> a -> GMachineContext ->
-               GCodeSequence -> [(GMachineAddress, GenericGData)] -> IO GMachineState
-newGMachine graphSize userState gmc initCode initData =
+               GCodeSequence -> [(GMachineAddress, GenericGData)] ->
+               Bool -> Bool -> IO GMachineState
+newGMachine graphSize userState gmc initCode initData debug trace =
     do
       graph <- newArray (GMachineAddress 0, GMachineAddress $ graphSize - 1) Hole
       let gmachine = GMachineState { gmachineStack = [], -- create initial gmachine, so we can run allocGraphCells
@@ -74,7 +83,8 @@ newGMachine graphSize userState gmc initCode initData =
                                      gmachineInitData = initData,
                                      gmachineFreeCells = IntSet.fromList [0..graphSize - 1],
                                      gmachineIndent = 0,
-                                     gmachineDebug = False,
+                                     gmachineDebug = debug,
+                                     gmachineTracing = trace,
                                      gmachineUserState = toDyn userState,
                                      gmachineContext = gmc}
 
@@ -83,7 +93,13 @@ newGMachine graphSize userState gmc initCode initData =
                                writeGraph addr dat
                                modify (\st -> st { gmachineFreeCells = IntSet.delete (fromIntegral addr) $ gmachineFreeCells st }))) gmachine
       let Right (gmachine', _) = res
-      return gmachine'
+
+      (gmachine'', code) <- gshow' gmachine' initCode
+      (gmachine''', dat) <- gshow' gmachine'' initData
+      infoM moduleName $ "Initial code: " ++ code
+      infoM moduleName $ "Initial data: " ++ dat
+
+      return gmachine'''
 
       -- -- allocate space for globals and builtins
       -- res <- runGMachine (replicateM globalCount allocGraphCell) gmachine
@@ -172,16 +188,6 @@ popInstr = do
 replaceInstrs :: GCodeSequence -> GMachine ()
 replaceInstrs newCode = modify (\state -> state { gmachineCode = newCode })
 
-readGraph :: GMachineAddress -> GMachine GenericGData
-readGraph addr = do
-  graphData <- liftM gmachineGraph get
-  liftIO $ readArray graphData addr
-
-writeGraph :: GMachineAddress -> GenericGData -> GMachine ()
-writeGraph addr x = do
-  graphData <- liftM gmachineGraph get
-  liftIO $ writeArray graphData addr x
-
 allocGraphCell :: GMachine GMachineAddress
 allocGraphCell = do
   freeCells <- liftM gmachineFreeCells get
@@ -256,11 +262,10 @@ step = do
   stack <- liftM gmachineStack get
   trace "-------"
   trace $ "Evaluating " ++ show instr ++ " of " ++ show is
-  stackDescr <- do
-         entries <- mapM readGraph stack
-         return $ concatMap (\(s, e) -> "(" ++ show s ++ " == " ++ show e ++ ")") $
-                zip stack entries
-  trace $ "    with Stack " ++ stackDescr
+  trace $ "    with Stack "
+  zip stack <$> mapM readGraph stack >>=
+      mapM (\(s, e) -> gshow e >>= \e -> trace ("      " ++ show s ++ ": " ++ e ++ ""))
+  waitForStep
   case instr of
     Eval -> doEval
     Unwind -> doUnwind
@@ -524,6 +529,48 @@ trace s = do
       liftIO $ putStrLn $ (replicate (gmachineIndent st) ' ') ++ s
    else return ()
 
+waitForStep :: GMachine ()
+waitForStep = do
+  st <- get
+  let prompt = do
+                liftIO $ putStr "(s)tep, (a)bort, (c)ontinue? "
+                liftIO $ hFlush stdout
+                i <- liftIO $ getLine
+                case i of
+                  "s" -> liftIO (putStrLn "") >> return ()
+                  "a" -> fail "aborted"
+                  "c" -> do
+                         put st { gmachineTracing = False }
+                  "gr" -> do
+                         assocs <- liftIO $ getAssocs (gmachineGraph st)
+                         forM_ assocs $ \(addr, d) ->
+                             case d of
+                               Hole -> return ()
+                               _ -> do
+                                 ds <- gshow d
+                                 liftIO $ putStrLn (show addr ++ ": " ++ ds)
+                         prompt
+                  'd':args -> case reads args of
+                                [(addr, "")] -> do
+                                                fn <- readGraph (GMachineAddress addr)
+                                                if withGenericData isBuiltin fn
+                                                then case withGenericData asBuiltin fn of
+                                                       Fun arity seq -> prettyPrintFn arity seq >> prompt
+                                                       _ -> liftIO (putStrLn "Not a function") >> prompt
+                                                else liftIO (putStrLn "Not a builtin type") >> prompt
+                                _ -> liftIO (putStrLn "") >> prompt
+                  _ -> liftIO (putStrLn "") >> prompt
+
+      prettyPrintFn arity seq = liftIO $ do
+                                  let maxDigits = length (show (length seq - 1))
+
+                                      offsLabels = map (printf (concat ["%0", show maxDigits, "d"]) :: Int -> String) [0..]
+                                  putStrLn (concat ["Function with ", show arity, " argument(s)"])
+                                  forM_ (zip offsLabels seq) $ \(offs, instr) -> do
+                                           putStrLn (concat ["    ", offs, ": ", show instr])
+                                  return ()
+  when (gmachineTracing st) prompt
+
 freezeState :: GMachineState -> IO GMachineFrozenState
 freezeState GMachineState {..} = do
   graph <- freeze gmachineGraph
@@ -534,7 +581,8 @@ freezeState GMachineState {..} = do
                          gmachineFrozenDump = gmachineDump,
                          gmachineFrozenInitData = map fst gmachineInitData,
                          gmachineFrozenFreeCells = gmachineFreeCells,
-                         gmachineFrozenDebug = gmachineDebug}
+                         gmachineFrozenDebug = gmachineDebug,
+                         gmachineFrozenTracing = gmachineTracing}
 
 thawState :: Typeable a => a -> GMachineFrozenState -> IO GMachineState
 thawState userSt GMachineFrozenState {..} = do
@@ -548,6 +596,7 @@ thawState userSt GMachineFrozenState {..} = do
                gmachineFreeCells = gmachineFrozenFreeCells,
                gmachineIndent = 0,
                gmachineDebug = gmachineFrozenDebug,
+               gmachineTracing = gmachineFrozenTracing,
                gmachineUserState = toDyn userSt,
                gmachineContext = GMachineContext {
                                    gmcModules = Map.empty,

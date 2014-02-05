@@ -6,5 +6,7 @@ module Language.Flow.Types where
 
     data FlowCompileOptions = Options {
                              builtinModules :: M.Map ModuleName Module,
-                             builtinTypes :: M.Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData)
+                             builtinTypes :: M.Map GTypeName (GConstr -> [GMachineAddress] -> GenericGData),
+                             startInDebug :: Bool,
+                             startTracing :: Bool
                            }

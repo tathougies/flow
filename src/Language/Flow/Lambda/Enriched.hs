@@ -16,6 +16,7 @@ import qualified Data.Text as T
 import Data.Int
 import Data.String
 import Data.Typeable
+import Debug.Trace
 
 import Language.Flow.Execution.Types hiding (Ap, IntConstant, StringConstant, DoubleConstant)
 import Language.Flow.Execution.GMachine (newGMachineStateWithGCodeProgram, runGMachine, continue)
@@ -67,7 +68,15 @@ collectFreeVariables alreadyBound expr = Set.toList $ collectFreeVariables' (Set
               freeInExpr = collectFreeVariables' (alreadyBound `Set.union` (Set.fromList bindingVars)) e
           in
             freeInBindings `Set.union` freeInExpr
+      collectFreeVariables' alreadyBound (Case var patsAndExprs) =
+          let alreadyBound' = alreadyBound `Set.union` Set.singleton var
+              freeInExprs = map (\(pat, expr) -> collectFreeVariables' (alreadyBound' `Set.union` boundInPattern pat) expr) patsAndExprs
+          in Set.unions freeInExprs
       collectFreeVariables' alreadyBound _ = Set.empty
+
+      boundInPattern :: Pattern -> Set.Set VarID
+      boundInPattern PlaceholderPattern = Set.empty
+      boundInPattern (ConstrPattern _ vars) = Set.fromList vars
 
 -- Lifts all lambda expressions
 liftLambdas :: Expression -> State Program Expression
@@ -100,6 +109,12 @@ liftLambdas (Lambda varIds expression) = do
 
   -- Now build the appropriate Ap chain
   return $ foldl Ap (SCRef scName) $ map Variable freeVariables
+liftLambdas (Case v patsAndExprs) = do
+  patsAndExprs' <- forM patsAndExprs $ \(pat, expr) ->
+                   do
+                     expr' <- liftLambdas expr
+                     return (pat, expr')
+  return $ Case v patsAndExprs'
 liftLambdas x = return x -- everything else just stays as is!
 
 newSCName :: State Program SCName
@@ -123,14 +138,16 @@ compileProgram scBase program =
                                          bodySC <- newSCName
                                          addSC bodySC (SuperCombinator [] liftedBody)
                                          return bodySC) program'
-        finalSCS = programSupercombinators program''
+        finalSCS = trace (show (bodySC, program'')) (programSupercombinators program'')
 
         labelledCompiledSCS = Map.assocs $ Map.mapKeysMonotonic (fromIntegral.(+(fromIntegral scBase))) $ Map.map (compileSC scBase) finalSCS
     in
       GCodeProgram { initCode = [PushLocation $ fromIntegral bodySC + fromIntegral scBase, Eval, ProgramDone],
                      initialData = labelledCompiledSCS,
                      progModules = Map.empty,
-                     progTypes = Map.empty}
+                     progTypes = Map.empty,
+                     progTrace = False,
+                     progDebug = False}
 
     where
       compileSC :: GMachineAddress -> SuperCombinator -> GenericGData
@@ -153,8 +170,9 @@ compileProgram scBase program =
       compileSubExpr _ _ scBase (SCRef scName) = [PushLocation $ fromIntegral scName + fromIntegral scBase]
       compileSubExpr _ _ _ (LocationRef l) = [PushLocation l]
       compileSubExpr argMap stackDepth _ (Variable varId) =
-          let Just argLocation = Map.lookup varId argMap
-          in [Push $ StackOffset $ (fromIntegral stackDepth) - argLocation]
+          case Map.lookup varId argMap of
+            Just argLocation -> [Push $ StackOffset $ (fromIntegral stackDepth) - argLocation]
+            Nothing -> error ("Internal error: Couldn't find variable " ++ (show (Variable varId)))
       compileSubExpr argMap stackDepth scBase (Ap e1 e2) =
           let compiled1 = compileSubExpr argMap (stackDepth + 1) scBase e1
               compiled2 = compileSubExpr argMap stackDepth scBase e2

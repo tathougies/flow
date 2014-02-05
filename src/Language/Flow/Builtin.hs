@@ -165,5 +165,7 @@ flowTypes = M.fromList [(typeName (undefined :: GBool), constrBool),
 flowDefaultCompileOptions :: FlowCompileOptions
 flowDefaultCompileOptions = Options {
                               builtinModules = flowBuiltinModules,
-                              builtinTypes = flowTypes
+                              builtinTypes = flowTypes,
+                              startInDebug = False,
+                              startTracing = True
                             }
